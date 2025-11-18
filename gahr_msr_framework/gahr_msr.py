@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 
-from raganything.reranking.colbert_reranker import ColBERTReranker, ColBERTConfig
-from raganything.reranking.hybrid_retrieval import (
+from gahr_msr_framework.colbert_reranker import ColBERTReranker, ColBERTConfig
+from gahr_msr_framework.hybrid_retrieval import (
     HybridRetriever,
     HybridRetrievalConfig,
     GraphAwareFilter
@@ -90,7 +90,7 @@ class GAHRMSRQuery:
 
     Example:
         >>> from raganything import RAGAnything
-        >>> from raganything.reranking import GAHRMSRQuery, GAHRMSRConfig
+        >>> from gahr_msr_framework import GAHRMSRQuery, GAHRMSRConfig
         >>>
         >>> # Initialize RAGAnything (processes documents and builds graph)
         >>> rag = RAGAnything(config=config, llm_model_func=llm_func, ...)

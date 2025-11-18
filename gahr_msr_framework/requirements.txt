@@ -5,15 +5,11 @@
 torch>=2.0.0
 transformers>=4.30.0
 
-# ColBERT model support
-# Note: colbert-ai package can be used as alternative to transformers implementation
-# colbert-ai>=0.2.0  # Optional: Official ColBERT implementation
-
 # Numpy for numerical operations
 numpy>=1.24.0
 
-# Optional: SPLADE for sparse retrieval
-# sentence-transformers>=2.2.0  # For SPLADE embeddings
+# Optional: SPLADE for sparse retrieval (not yet implemented)
+# sentence-transformers>=2.2.0
 
 # Already included in main RAGAnything requirements:
 # - lightrag-hku (for graph construction and base RAG)
@@ -24,3 +20,5 @@ numpy>=1.24.0
 # pip install torch --index-url https://download.pytorch.org/whl/cu118
 # or for CUDA 12.1:
 # pip install torch --index-url https://download.pytorch.org/whl/cu121
+# or for Apple Silicon (M1/M2/M3):
+# PyTorch 2.0+ has built-in MPS support

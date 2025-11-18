@@ -45,8 +45,8 @@ from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.utils import EmbeddingFunc, logger, set_verbose_debug
 from raganything import RAGAnything, RAGAnythingConfig
 
-# Import GAHR-MSR framework
-from raganything.reranking import GAHRMSRQuery, GAHRMSRConfig
+# Import GAHR-MSR framework from independent directory
+from gahr_msr_framework import GAHRMSRQuery, GAHRMSRConfig
 
 from dotenv import load_dotenv
 
@@ -93,6 +93,11 @@ def configure_logging():
             },
             "loggers": {
                 "lightrag": {
+                    "handlers": ["console", "file"],
+                    "level": "INFO",
+                    "propagate": False,
+                },
+                "gahr_msr_framework": {
                     "handlers": ["console", "file"],
                     "level": "INFO",
                     "propagate": False,
