@@ -284,6 +284,61 @@ async def process_with_rag(
         #     await rag.finalize_storages()
 
 
+        # Helper function to query with all modes
+        async def query_all_modes(query_text: str):
+            """Query using all retrieval modes and return results"""
+            modes = ["local", "global", "hybrid", "naive", "mix"]
+            results = {}
+
+            for mode in modes:
+                try:
+                    logger.info(f"  Querying with mode: {mode}")
+                    answer = await rag.aquery(query_text, mode=mode)
+                    results[mode] = answer
+                except Exception as e:
+                    logger.warning(f"  Error in mode {mode}: {str(e)}")
+                    results[mode] = f"Error: {str(e)}"
+
+            return results
+
+        # Helper function to let LLM evaluate the best answer
+        async def evaluate_best_answer(query_text: str, mode_results: dict):
+            """Let LLM evaluate which mode's output is best"""
+            # Prepare evaluation prompt
+            results_text = "\n\n".join([
+                f"【{mode.upper()} MODE】\n{answer}"
+                for mode, answer in mode_results.items()
+            ])
+
+            evaluation_prompt = f"""You are an expert evaluator. Given a user query and answers from different retrieval modes, evaluate which answer is the most comprehensive, accurate, and helpful.
+
+User Query: {query_text}
+
+Answers from different retrieval modes:
+{results_text}
+
+Please analyze each answer based on:
+1. Completeness - Does it fully answer the question?
+2. Accuracy - Is the information correct?
+3. Relevance - Does it stay focused on the query?
+4. Clarity - Is it well-structured and easy to understand?
+
+Provide your evaluation in this format:
+- Best Mode: [mode name]
+- Reasoning: [brief explanation of why this mode performed best]
+- Final Answer: [the best answer, optionally enhanced or combined if beneficial]
+"""
+
+            try:
+                evaluation = await llm_model_func_with_retry(
+                    evaluation_prompt,
+                    system_prompt="You are a helpful assistant that evaluates retrieval results."
+                )
+                return evaluation
+            except Exception as e:
+                logger.error(f"Error in evaluation: {str(e)}")
+                return f"Evaluation failed: {str(e)}\n\nDefaulting to HYBRID mode result:\n{mode_results.get('hybrid', 'N/A')}"
+
         # Example queries - demonstrating different query approaches
         logger.info("\nQuerying processed document:")
 
@@ -297,24 +352,45 @@ async def process_with_rag(
         ]
 
         for query in text_queries:
-            logger.info(f"\n[Text Query]: {query}")
+            logger.info(f"\n{'='*80}")
+            logger.info(f"[Text Query]: {query}")
+            logger.info(f"{'='*80}")
 
-            # Query with similarity scores
             try:
-                # result = await rag.aquery(query, mode="hybrid")
-                query_param = QueryParam(mode="naive", only_need_prompt=True)  
-                raw_prompt = await rag.lightrag.aquery(query, query_param)
-                with open(os.path.join(output_dir, "raw_prompt.txt"), "a", encoding="utf-8") as f:
-                    f.write(f"\n\n[Query]: {query}\n")
-                    f.write(raw_prompt)
+                # Get results from all modes
+                logger.info("\n[Step 1/3] Querying with all retrieval modes...")
+                mode_results = await query_all_modes(query)
 
-                answer = await rag.aquery(query, mode="mix")
-                logger.info(f"Answer: {answer}")
+                # Save raw results
+                results_file = os.path.join(output_dir, "mode_results.txt")
+                with open(results_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n\n{'='*80}\n")
+                    f.write(f"Query: {query}\n")
+                    f.write(f"{'='*80}\n\n")
+                    for mode, answer in mode_results.items():
+                        f.write(f"【{mode.upper()} MODE】\n")
+                        f.write(f"{answer}\n")
+                        f.write(f"{'-'*80}\n\n")
+
+                # Let LLM evaluate the best answer
+                logger.info("\n[Step 2/3] Evaluating results with LLM...")
+                evaluation = await evaluate_best_answer(query, mode_results)
+
+                # Log and save evaluation
+                logger.info("\n[Step 3/3] LLM Evaluation Result:")
+                logger.info(f"\n{evaluation}")
+
+                eval_file = os.path.join(output_dir, "evaluations.txt")
+                with open(eval_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n\n{'='*80}\n")
+                    f.write(f"Query: {query}\n")
+                    f.write(f"{'='*80}\n")
+                    f.write(f"{evaluation}\n")
+
             except Exception as e:
-                logger.warning(f"Error query: {str(e)}")
-                # Fallback to regular query
-                # result = await rag.aquery(query, mode="hybrid")
-                # logger.info(f"Answer: {result}")
+                logger.warning(f"Error in query processing: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
             finally:
                 await rag.lightrag.finalize_storages()
 
