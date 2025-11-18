@@ -356,7 +356,67 @@ async def process_with_rag(
                 # Execute query based on mode
                 if use_gahr and gahr_query:
                     logger.info("Using GAHR-MSR high-precision query...")
-                    answer = await gahr_query.query(query, mode="hybrid")
+
+                    # Get result with debug info
+                    result = await gahr_query.query(
+                        query,
+                        mode="hybrid",
+                        return_debug_info=True
+                    )
+
+                    # Extract answer and debug info
+                    if isinstance(result, dict) and 'debug_info' in result:
+                        answer = result['answer']
+                        debug = result['debug_info']
+
+                        # Display debug information
+                        logger.info("\n" + "="*70)
+                        logger.info("Debug Information:")
+                        logger.info("="*70)
+                        logger.info(f"Chunks Retrieved: {debug['chunks_retrieved']}")
+                        logger.info(f"Chunks After Reranking: {debug['chunks_after_reranking']}")
+
+                        if debug.get('colbert_scores'):
+                            logger.info(f"\nColBERT Scores (Top {len(debug['colbert_scores'])}):")
+                            for rank, score in enumerate(debug['colbert_scores'], 1):
+                                logger.info(f"  Rank {rank}: {score:.4f}")
+
+                        if debug.get('initial_scores'):
+                            avg_initial = sum(debug['initial_scores']) / len(debug['initial_scores']) if debug['initial_scores'] else 0
+                            logger.info(f"\nInitial Average Score: {avg_initial:.4f}")
+
+                        logger.info("="*70 + "\n")
+
+                        # Save debug info to file
+                        debug_file = os.path.join(output_dir, f"debug_info_gahr_query_{i}.txt")
+                        with open(debug_file, "w", encoding="utf-8") as f:
+                            f.write(f"Query: {query}\n")
+                            f.write("="*70 + "\n\n")
+
+                            f.write("=== PROMPT SENT TO LLM ===\n")
+                            f.write(debug['prompt'])
+                            f.write("\n\n")
+
+                            f.write("=== SIMILARITY SCORES ===\n")
+                            if debug.get('colbert_scores'):
+                                f.write(f"\nColBERT Scores (Token-level similarity):\n")
+                                for idx, score in enumerate(debug['colbert_scores'], 1):
+                                    f.write(f"  Rank {idx}: {score:.6f}\n")
+
+                            if debug.get('initial_scores'):
+                                f.write(f"\nInitial Retrieval Scores:\n")
+                                for idx, score in enumerate(debug['initial_scores'][:10], 1):
+                                    f.write(f"  Rank {idx}: {score:.6f}\n")
+
+                            f.write("\n=== RERANKED CHUNKS ===\n")
+                            for idx, chunk in enumerate(debug.get('reranked_chunks', []), 1):
+                                f.write(f"\n--- Chunk {idx} ---\n")
+                                f.write(f"ColBERT Score: {chunk.get('colbert_score', 'N/A')}\n")
+                                f.write(f"Text: {chunk.get('text', '')[:200]}...\n")
+
+                        logger.info(f"Debug info saved to: {debug_file}")
+                    else:
+                        answer = result
                 else:
                     logger.info("Using standard RAG query...")
                     answer = await rag.aquery(query, mode="mix")

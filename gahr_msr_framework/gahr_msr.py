@@ -313,7 +313,8 @@ class GAHRMSRQuery:
         mode: str = "hybrid",
         use_graph_filter: Optional[bool] = None,
         use_reranking: Optional[bool] = None,
-        return_context_only: bool = False
+        return_context_only: bool = False,
+        return_debug_info: bool = False
     ) -> str | Dict[str, Any]:
         """
         Perform GAHR-MSR query with multi-stage retrieval and re-ranking
@@ -324,9 +325,10 @@ class GAHRMSRQuery:
             use_graph_filter: Enable graph filtering (None uses config default)
             use_reranking: Enable re-ranking (None uses config default)
             return_context_only: If True, return only re-ranked context without LLM generation
+            return_debug_info: If True, return detailed debug information including prompt and scores
 
         Returns:
-            Query result string or context dictionary if return_context_only=True
+            Query result string or dictionary with debug info if return_debug_info=True
         """
         logger.info("="*60)
         logger.info("GAHR-MSR Query Pipeline Started")
@@ -338,6 +340,20 @@ class GAHRMSRQuery:
         use_graph = use_graph_filter if use_graph_filter is not None else self.config.enable_graph_filtering
         use_rerank = use_reranking if use_reranking is not None else self.config.enable_colbert_reranking
 
+        # Initialize debug info dictionary
+        debug_info = {
+            'query': query,
+            'mode': mode,
+            'use_graph_filter': use_graph,
+            'use_reranking': use_rerank,
+            'chunks_retrieved': 0,
+            'chunks_after_reranking': 0,
+            'colbert_scores': [],
+            'initial_scores': [],
+            'context': '',
+            'prompt': '',
+        }
+
         # Phase 1: Get initial candidates from LightRAG
         logger.info("\n--- Phase 1: Initial Retrieval from LightRAG ---")
         chunks = await self._get_chunks_from_lightrag(
@@ -345,6 +361,9 @@ class GAHRMSRQuery:
             mode=mode,
             top_k=self.config.hybrid_top_k
         )
+
+        debug_info['chunks_retrieved'] = len(chunks)
+        debug_info['initial_scores'] = [chunk.get('score', 0.0) for chunk in chunks]
 
         if not chunks:
             logger.warning("No chunks retrieved. Falling back to standard query.")
@@ -378,32 +397,51 @@ class GAHRMSRQuery:
                 candidate_texts = chunk_texts[:colbert_candidates]
                 candidate_chunks = chunks[:colbert_candidates]
 
-                # Re-rank with ColBERT
-                ranked_indices = await self.colbert_reranker.rerank(
+                # Re-rank with ColBERT - GET SCORES
+                ranked_results = await self.colbert_reranker.rerank(
                     query=query,
                     documents=candidate_texts,
                     top_k=self.config.final_top_k,
-                    return_scores=False
+                    return_scores=True  # Get scores for debug info
                 )
+
+                # Extract indices and scores
+                ranked_indices = [idx for idx, score in ranked_results]
+                colbert_scores = [score for idx, score in ranked_results]
 
                 # Reorder chunks based on ColBERT ranking
                 reranked_chunks = [candidate_chunks[idx] for idx in ranked_indices]
 
+                # Add ColBERT scores to chunks
+                for i, chunk in enumerate(reranked_chunks):
+                    chunk['colbert_score'] = colbert_scores[i]
+
+                # Store scores in debug info
+                debug_info['colbert_scores'] = colbert_scores
+                debug_info['chunks_after_reranking'] = len(reranked_chunks)
+
                 logger.info(f"Re-ranked {len(candidate_texts)} chunks, selected top {len(reranked_chunks)}")
+                logger.info(f"Top ColBERT score: {colbert_scores[0]:.4f}" if colbert_scores else "")
 
             except Exception as e:
                 logger.error(f"ColBERT re-ranking failed: {e}")
                 # Fall back to original ranking
                 reranked_chunks = chunks[:self.config.final_top_k]
+                debug_info['chunks_after_reranking'] = len(reranked_chunks)
         else:
             # No re-ranking, just take top-k
             reranked_chunks = chunks[:self.config.final_top_k]
+            debug_info['chunks_after_reranking'] = len(reranked_chunks)
 
         # Prepare context from re-ranked chunks
         context_text = "\n\n".join([
             f"[Context {i+1}]\n{chunk.get('text', '')}"
             for i, chunk in enumerate(reranked_chunks)
         ])
+
+        # Store context in debug info
+        debug_info['context'] = context_text
+        debug_info['reranked_chunks'] = reranked_chunks
 
         # Return context only if requested
         if return_context_only:
@@ -427,6 +465,9 @@ Question: {query}
 
 Answer:"""
 
+            # Store prompt in debug info
+            debug_info['prompt'] = prompt
+
             # Call LLM
             result = await self.rag.llm_model_func(
                 prompt,
@@ -437,11 +478,26 @@ Answer:"""
             logger.info("GAHR-MSR Query Pipeline Completed")
             logger.info("="*60)
 
+            # Return debug info if requested
+            if return_debug_info:
+                return {
+                    'answer': result,
+                    'debug_info': debug_info
+                }
+
             return result
 
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
-            return f"Error generating response: {e}"
+            error_msg = f"Error generating response: {e}"
+
+            if return_debug_info:
+                return {
+                    'answer': error_msg,
+                    'debug_info': debug_info
+                }
+
+            return error_msg
 
     def get_config(self) -> GAHRMSRConfig:
         """Get current configuration"""
