@@ -1,12 +1,15 @@
 #!/usr/bin/env python
 """
-Example script demonstrating the integration of MinerU parser with RAGAnything
+Adaptive RAG Example using QueryRouter
 
-This example shows how to:
-1. Process documents with RAGAnything using MinerU parser
-2. Perform pure text queries using aquery() method
-3. Perform multimodal queries with specific multimodal content using aquery_with_multimodal() method
-4. Handle different types of multimodal content (tables, equations) in queries
+This example demonstrates how to use the QueryRouter module for intelligent
+query classification and mode selection in a RAG pipeline.
+
+Features:
+- Uses QueryRouter for automatic complexity classification
+- Dynamically selects optimal retrieval modes
+- Includes source citation and two-stage evaluation
+- Configurable retrieval strategy (adaptive vs comprehensive)
 """
 
 import os
@@ -16,83 +19,70 @@ import logging
 import logging.config
 from pathlib import Path
 from tenacity import retry, stop_after_attempt, wait_exponential
-from lightrag import LightRAG
-
 
 # Add project root directory to Python path
 import sys
-
 sys.path.append(str(Path(__file__).parent.parent))
+
 from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.utils import EmbeddingFunc, logger, set_verbose_debug
 from lightrag.kg.shared_storage import initialize_pipeline_status
-from lightrag import LightRAG
+from lightrag import LightRAG, QueryParam
 from raganything import RAGAnything, RAGAnythingConfig
 
 from dotenv import load_dotenv
-from lightrag import QueryParam
-from query_router import QueryRouter  
-
+from query_router import QueryRouter, RouterConfig
 
 load_dotenv(dotenv_path=".env", override=True)
 
+
 def configure_logging():
     """Configure logging for the application"""
-    # Get log directory path from environment variable or use current directory
     log_dir = os.getenv("LOG_DIR", os.getcwd())
-    log_file_path = os.path.abspath(os.path.join(log_dir, "raganything_example.log"))
+    log_file_path = os.path.abspath(os.path.join(log_dir, "adaptive_rag_example.log"))
 
-    print(f"\nRAGAnything example log file: {log_file_path}\n")
+    print(f"\nAdaptive RAG example log file: {log_file_path}\n")
     os.makedirs(os.path.dirname(log_dir), exist_ok=True)
 
-    # Get log file max size and backup count from environment variables
-    log_max_bytes = int(os.getenv("LOG_MAX_BYTES", 10485760))  # Default 10MB
-    log_backup_count = int(os.getenv("LOG_BACKUP_COUNT", 5))  # Default 5 backups
+    log_max_bytes = int(os.getenv("LOG_MAX_BYTES", 10485760))
+    log_backup_count = int(os.getenv("LOG_BACKUP_COUNT", 5))
 
-    logging.config.dictConfig(
-        {
-            "version": 1,
-            "disable_existing_loggers": False,
-            "formatters": {
-                "default": {
-                    "format": "%(levelname)s: %(message)s",
-                },
-                "detailed": {
-                    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                },
+    logging.config.dictConfig({
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {"format": "%(levelname)s: %(message)s"},
+            "detailed": {"format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"},
+        },
+        "handlers": {
+            "console": {
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stderr",
             },
-            "handlers": {
-                "console": {
-                    "formatter": "default",
-                    "class": "logging.StreamHandler",
-                    "stream": "ext://sys.stderr",
-                },
-                "file": {
-                    "formatter": "detailed",
-                    "class": "logging.handlers.RotatingFileHandler",
-                    "filename": log_file_path,
-                    "maxBytes": log_max_bytes,
-                    "backupCount": log_backup_count,
-                    "encoding": "utf-8",
-                },
+            "file": {
+                "formatter": "detailed",
+                "class": "logging.handlers.RotatingFileHandler",
+                "filename": log_file_path,
+                "maxBytes": log_max_bytes,
+                "backupCount": log_backup_count,
+                "encoding": "utf-8",
             },
-            "loggers": {
-                "lightrag": {
-                    "handlers": ["console", "file"],
-                    "level": "INFO",
-                    "propagate": False,
-                },
+        },
+        "loggers": {
+            "lightrag": {
+                "handlers": ["console", "file"],
+                "level": "INFO",
+                "propagate": False,
             },
-        }
-    )
+        },
+    })
 
-    # Set the logger level to INFO
     logger.setLevel(logging.INFO)
-    # Enable verbose debug if needed
     set_verbose_debug(os.getenv("VERBOSE", "false").lower() == "true")
 
 
-async def process_with_rag(
+async def process_with_adaptive_rag(
     file_path: str,
     output_dir: str,
     api_key: str,
@@ -101,34 +91,32 @@ async def process_with_rag(
     parser: str = None,
 ):
     """
-    Process document with RAGAnything
+    Process document with Adaptive RAG using QueryRouter
 
     Args:
         file_path: Path to the document
-        output_dir: Output directory for RAG results
+        output_dir: Output directory for results
         api_key: OpenAI API key
         base_url: Optional base URL for API
         working_dir: Working directory for RAG storage
+        parser: Parser to use (mineru or docling)
     """
     try:
         # Create RAGAnything configuration
         config = RAGAnythingConfig(
             working_dir=working_dir or "./rag_storage",
-            parser=parser,  # Parser selection: mineru or docling
-            parse_method="auto",  # Parse method: auto, ocr, or txt
+            parser=parser,
+            parse_method="auto",
             enable_image_processing=True,
             enable_table_processing=True,
             enable_equation_processing=True,
         )
+
         llm_model = os.getenv("LLM_MODEL", "google/gemini-3-pro-preview")
         vision_model = os.getenv("VISION_MODEL", "google/gemini-3-pro-preview")
-        print(f"llm_model: {llm_model}")
-        #llm_model = os.getenv("LLM_MODEL", "google/gemini-2.5-flash")
-        #vision_model = os.getenv("VISION_MODEL", "google/gemini-2.5-flash")
-        
-        # Get timeout settings
         llm_timeout = int(os.getenv("LLM_TIMEOUT", "300"))
         embedding_timeout = int(os.getenv("EMBEDDING_TIMEOUT", "120"))
+
         # Define LLM model function
         async def llm_model_func_with_retry(prompt, system_prompt=None, history_messages=[], **kwargs):
             kwargs.setdefault('timeout', llm_timeout)
@@ -147,7 +135,7 @@ async def process_with_rag(
                 llm_model_func_with_retry(prompt, system_prompt, history_messages, **kwargs)
             )
 
-        # Define vision model function for image processing with timeout
+        # Define vision model function
         @retry(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -162,68 +150,35 @@ async def process_with_rag(
             **kwargs,
         ):
             kwargs.setdefault('timeout', llm_timeout)
-            # If messages format is provided (for multimodal VLM enhanced query), use it directly
             if messages:
                 return await openai_complete_if_cache(
-                    vision_model,
-                    "",
-                    system_prompt=None,
-                    history_messages=[],
-                    messages=messages,
-                    api_key=api_key,
-                    base_url=base_url,
-                    **kwargs,
+                    vision_model, "", system_prompt=None, history_messages=[],
+                    messages=messages, api_key=api_key, base_url=base_url, **kwargs,
                 )
-            # Traditional single image format
             elif image_data:
                 return await openai_complete_if_cache(
-                    vision_model,
-                    "",
-                    system_prompt=None,
-                    history_messages=[],
+                    vision_model, "", system_prompt=None, history_messages=[],
                     messages=[
-                        {"role": "system", "content": system_prompt}
-                        if system_prompt
-                        else None,
+                        {"role": "system", "content": system_prompt} if system_prompt else None,
                         {
                             "role": "user",
                             "content": [
                                 {"type": "text", "text": prompt},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{image_data}"
-                                    },
-                                },
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
                             ],
-                        }
-                        if image_data
-                        else {"role": "user", "content": prompt},
+                        } if image_data else {"role": "user", "content": prompt},
                     ],
-                    api_key=api_key,
-                    base_url=base_url,
-                    **kwargs,
+                    api_key=api_key, base_url=base_url, **kwargs,
                 )
-            # Pure text format
             else:
                 return await llm_model_func_with_retry(prompt, system_prompt, history_messages, **kwargs)
 
-        def vision_model_func(
-            prompt,
-            system_prompt=None,
-            history_messages=[],
-            image_data=None,
-            messages=None,
-            **kwargs,
-        ):
+        def vision_model_func(prompt, system_prompt=None, history_messages=[], image_data=None, messages=None, **kwargs):
             return asyncio.create_task(
-                vision_model_func_with_retry(
-                    prompt, system_prompt, history_messages, image_data, messages, **kwargs
-                )
+                vision_model_func_with_retry(prompt, system_prompt, history_messages, image_data, messages, **kwargs)
             )
 
-
-        # Define embedding function - using environment variables for configuration
+        # Define embedding function
         embedding_dim = int(os.getenv("EMBEDDING_DIM", "3072"))
         embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
 
@@ -231,23 +186,19 @@ async def process_with_rag(
             embedding_dim=embedding_dim,
             max_token_size=8192,
             func=lambda texts: openai_embed(
-                texts,
-                model=embedding_model,
-                api_key=api_key,
-                base_url=base_url,
-                client_configs={
-                    "timeout": 30,  
-                },
+                texts, model=embedding_model, api_key=api_key, base_url=base_url,
+                client_configs={"timeout": 30},
             ),
         )
 
-        # Initialize RAGAnything with new dataclass structure
+        # Initialize RAGAnything
         rag = RAGAnything(
             config=config,
             llm_model_func=llm_model_func,
             vision_model_func=vision_model_func,
             embedding_func=embedding_func,
         )
+
         try:
             if rag.lightrag is None:
                 rag.lightrag = LightRAG(
@@ -266,45 +217,46 @@ async def process_with_rag(
             await rag.lightrag.initialize_storages()
             await initialize_pipeline_status()
 
+        # ========================================================================
+        # Initialize QueryRouter for Adaptive RAG
+        # ========================================================================
 
-        # # Process document
-        # try:
-        #     # await rag.process_document_complete(
-        #     #     file_path=file_path, output_dir=output_dir, parse_method="auto"
-        #     # )
-        #     await rag.process_folder_complete(
-        #         folder_path=file_path, output_dir=output_dir, parse_method="auto",
-        #         file_extensions=[".pdf", ".docx", ".pptx"],
-        #         recursive=True,
-        #         max_workers=4
-        #     )
+        # Optional: Create custom configuration
+        router_config = RouterConfig(
+            simple_modes=["naive", "local"],
+            moderate_modes=["hybrid", "local"],
+            complex_modes=["mix", "global", "hybrid"],
+            confidence_threshold=0.3
+        )
 
-        # except Exception as e:
-        #     logger.error(f"Error processing document: {str(e)}")
-        # finally:
-        #     await rag.finalize_storages()
+        query_router = QueryRouter(
+            llm_func=llm_model_func_with_retry,
+            config=router_config,
+            logger=logger
+        )
 
+        logger.info("✓ QueryRouter initialized")
+        logger.info(f"  - Simple queries    → {router_config.simple_modes}")
+        logger.info(f"  - Moderate queries  → {router_config.moderate_modes}")
+        logger.info(f"  - Complex queries   → {router_config.complex_modes}")
 
-        # Initialize Query Router for Adaptive RAG
-        query_router = QueryRouter(llm_func=llm_model_func_with_retry, logger=logger)
+        # ========================================================================
+        # Helper Functions
+        # ========================================================================
 
-        # Helper function to query with all modes and get source context
-        async def query_all_modes_with_context(query_text: str, modes: list = None):
-            """Query using all retrieval modes and return results with source context"""
-            if modes is None:
-                modes = ["local", "global", "hybrid", "naive", "mix"]
-
+        async def query_with_modes(query_text: str, modes: list) -> dict:
+            """Query using specified modes and return results with source context"""
             results = {}
 
             for mode in modes:
                 try:
                     logger.info(f"  Querying with mode: {mode}")
 
-                    # Step 1: Get the raw prompt with retrieved context
+                    # Get the raw prompt with retrieved context
                     query_param = QueryParam(mode=mode, only_need_prompt=True)
                     raw_prompt = await rag.lightrag.aquery(query_text, query_param)
 
-                    # Step 2: Create enhanced prompt asking LLM to cite sources
+                    # Create enhanced prompt asking LLM to cite sources
                     citation_prompt = f"""{raw_prompt}
 
 IMPORTANT: When answering, please cite the specific sources from the context above.
@@ -313,7 +265,7 @@ Use this format: [Source: brief description of the source section]
 
 Please provide your answer with source citations."""
 
-                    # Step 3: Get answer with citations
+                    # Get answer with citations
                     answer_with_sources = await llm_model_func_with_retry(
                         citation_prompt,
                         system_prompt="You are a helpful assistant that provides answers with clear source citations from the given context."
@@ -335,11 +287,10 @@ Please provide your answer with source citations."""
 
             return results
 
-        # Helper function for two-stage LLM evaluation to handle long context
-        async def evaluate_best_answer_two_stage(query_text: str, mode_results: dict):
-            """Two-stage evaluation to handle long context effectively"""
+        async def evaluate_results(query_text: str, mode_results: dict):
+            """Two-stage evaluation of results"""
 
-            # Stage 1: Evaluate each mode individually with scoring
+            # Stage 1: Individual evaluation
             logger.info("  Stage 1: Individual evaluation and scoring...")
             mode_evaluations = {}
 
@@ -381,7 +332,7 @@ Brief Summary: [2-3 sentences summarizing the answer's strengths and weaknesses]
                     logger.warning(f"    ✗ Error evaluating {mode}: {str(e)}")
                     mode_evaluations[mode] = f"Evaluation error: {str(e)}"
 
-            # Stage 2: Compare evaluations and select the best
+            # Stage 2: Comparative analysis
             logger.info("  Stage 2: Comparative analysis and final selection...")
 
             comparison_prompt = f"""Based on the individual evaluations below, determine which retrieval mode performed best for this query.
@@ -438,7 +389,6 @@ RECOMMENDED FINAL ANSWER
                 }
             except Exception as e:
                 logger.error(f"  Error in final evaluation: {str(e)}")
-                # Fallback to hybrid mode
                 hybrid_result = mode_results.get("hybrid", mode_results.get("mix", {}))
                 fallback_answer = hybrid_result.get("answer", "N/A") if isinstance(hybrid_result, dict) else str(hybrid_result)
                 return {
@@ -446,26 +396,24 @@ RECOMMENDED FINAL ANSWER
                     "final_evaluation": f"Final evaluation failed: {str(e)}\n\nDefaulting to HYBRID/MIX mode result:\n{fallback_answer}"
                 }
 
-        # Example queries - demonstrating different query approaches
-        logger.info("\nQuerying processed document:")
+        # ========================================================================
+        # Query Processing with Adaptive RAG
+        # ========================================================================
+
+        logger.info("\nQuerying processed document with Adaptive RAG:")
 
         # Configuration: Set retrieval strategy
-        # Options:
-        #   - "adaptive": Use Adaptive-RAG to intelligently select modes based on query complexity (RECOMMENDED)
-        #   - "comprehensive": Query all modes and compare (thorough but slower and more expensive)
-        retrieval_strategy = os.getenv("RETRIEVAL_STRATEGY", "adaptive")  # adaptive or comprehensive
+        retrieval_strategy = os.getenv("RETRIEVAL_STRATEGY", "adaptive")
 
-        logger.info(f"Retrieval Strategy: {retrieval_strategy.upper()}")
-        logger.info(f"  - adaptive: Smart mode selection based on query complexity")
+        logger.info(f"\nRetrieval Strategy: {retrieval_strategy.upper()}")
+        logger.info(f"  - adaptive: Smart mode selection via QueryRouter")
         logger.info(f"  - comprehensive: Query all 5 modes for comparison\n")
 
-        # 1. Pure text queries using aquery()
+        # Example queries
         text_queries = [
             "給我PCD急救人員名單，你可以使用工具計算",
             "給我樹林廠先進管理課急救人員，你可以使用工具計算",
             "給我樹林廠急救人員總共有幾位，你可以使用工具計算",
-            # "給我新竹廠健檢流程",
-            # "給我鶯歌廠安委會名單",
         ]
 
         for query in text_queries:
@@ -474,24 +422,28 @@ RECOMMENDED FINAL ANSWER
             logger.info(f"{'='*80}")
 
             try:
-                # Step 0: Adaptive RAG - Classify query complexity (if enabled)
+                # ============================================================
+                # Step 0: Adaptive RAG - Use QueryRouter
+                # ============================================================
+
                 selected_modes = None
-                classification_result = None
+                routing_result = None
 
                 if retrieval_strategy == "adaptive":
-                    logger.info("\n[Step 0/4] 🧠 Adaptive RAG: Classifying query complexity...")
-                    classification_result = await classify_query_complexity(query)
+                    logger.info("\n[Step 0/4] 🧠 Adaptive RAG: Using QueryRouter...")
 
-                    logger.info(f"  ├─ Complexity: {classification_result['complexity'].upper()}")
-                    logger.info(f"  ├─ Confidence: {classification_result['confidence']:.2f}")
-                    logger.info(f"  ├─ Reasoning: {classification_result['reasoning']}")
+                    # Use QueryRouter's complete routing pipeline
+                    routing_result = await query_router.route_query(query)
 
-                    # Select modes based on complexity
-                    selected_modes = select_modes_by_complexity(
-                        classification_result['complexity'],
-                        classification_result['recommended_modes']
-                    )
-                    logger.info(f"  └─ Selected Modes: {', '.join(m.upper() for m in selected_modes)}")
+                    classification = routing_result['classification']
+                    selected_modes = routing_result['selected_modes']
+                    efficiency_gain = routing_result['efficiency_gain']
+
+                    logger.info(f"  ├─ Complexity: {classification.complexity.upper()}")
+                    logger.info(f"  ├─ Confidence: {classification.confidence:.2f}")
+                    logger.info(f"  ├─ Reasoning: {classification.reasoning}")
+                    logger.info(f"  ├─ Selected Modes: {', '.join(m.upper() for m in selected_modes)}")
+                    logger.info(f"  └─ Efficiency Gain: {efficiency_gain:.0f}%")
 
                     # Save classification to file
                     classification_file = os.path.join(output_dir, "adaptive_classifications.txt")
@@ -499,20 +451,27 @@ RECOMMENDED FINAL ANSWER
                         f.write(f"\n{'='*80}\n")
                         f.write(f"Query: {query}\n")
                         f.write(f"{'='*80}\n")
-                        f.write(f"Complexity: {classification_result['complexity']}\n")
-                        f.write(f"Confidence: {classification_result['confidence']:.2f}\n")
-                        f.write(f"Reasoning: {classification_result['reasoning']}\n")
+                        f.write(f"Complexity: {classification.complexity}\n")
+                        f.write(f"Confidence: {classification.confidence:.2f}\n")
+                        f.write(f"Reasoning: {classification.reasoning}\n")
                         f.write(f"Selected Modes: {', '.join(selected_modes)}\n")
-                        f.write(f"\nFull Classification:\n{classification_result['raw_classification']}\n")
+                        f.write(f"Efficiency Gain: {efficiency_gain:.0f}%\n")
+                        f.write(f"\nFull Classification:\n{classification.raw_classification}\n")
 
-                # Step 1: Get results from selected/all modes with source context
+                # ============================================================
+                # Step 1: Query with selected modes
+                # ============================================================
+
                 step_num = "1/4" if retrieval_strategy == "adaptive" else "1/3"
                 mode_desc = f"selected modes ({', '.join(selected_modes)})" if selected_modes else "all modes"
                 logger.info(f"\n[Step {step_num}] Querying with {mode_desc} (with source citations)...")
 
-                mode_results = await query_all_modes_with_context(query, modes=selected_modes)
+                if selected_modes is None:
+                    selected_modes = ["local", "global", "hybrid", "naive", "mix"]
 
-                # Save detailed results with context
+                mode_results = await query_with_modes(query, modes=selected_modes)
+
+                # Save detailed results
                 results_file = os.path.join(output_dir, "mode_results_with_sources.txt")
                 with open(results_file, "a", encoding="utf-8") as f:
                     f.write(f"\n\n{'='*80}\n")
@@ -522,30 +481,38 @@ RECOMMENDED FINAL ANSWER
                         f.write(f"【{mode.upper()} MODE】\n")
                         f.write(f"Answer:\n{result_data['answer']}\n")
                         f.write(f"\n--- Retrieved Context ---\n")
-                        # Save first 2000 chars of context to avoid huge files
                         context_preview = result_data['raw_context'][:2000]
                         if len(result_data['raw_context']) > 2000:
                             context_preview += f"\n... (truncated, total length: {len(result_data['raw_context'])} chars)"
                         f.write(f"{context_preview}\n")
                         f.write(f"{'-'*80}\n\n")
 
+                # ============================================================
                 # Step 2: Two-stage LLM evaluation
+                # ============================================================
+
                 step_num = "2/4" if retrieval_strategy == "adaptive" else "2/3"
                 logger.info(f"\n[Step {step_num}] Two-stage LLM evaluation...")
-                evaluation_results = await evaluate_best_answer_two_stage(query, mode_results)
+                evaluation_results = await evaluate_results(query, mode_results)
 
+                # ============================================================
                 # Step 3: Log and save evaluation
+                # ============================================================
+
                 step_num = "3/4" if retrieval_strategy == "adaptive" else "3/3"
                 logger.info(f"\n[Step {step_num}] Evaluation Complete!")
                 logger.info(f"\n{evaluation_results['final_evaluation']}")
 
+                # ============================================================
                 # Step 4: Summary and insights (Adaptive RAG only)
-                if retrieval_strategy == "adaptive" and classification_result:
+                # ============================================================
+
+                if retrieval_strategy == "adaptive" and routing_result:
                     logger.info(f"\n[Step 4/4] 📊 Adaptive RAG Summary:")
-                    logger.info(f"  ├─ Query Complexity: {classification_result['complexity'].upper()}")
+                    logger.info(f"  ├─ Query Complexity: {routing_result['classification'].complexity.upper()}")
                     logger.info(f"  ├─ Modes Used: {', '.join(m.upper() for m in selected_modes)}")
                     logger.info(f"  ├─ Modes Saved: {5 - len(selected_modes)} mode(s) skipped")
-                    logger.info(f"  └─ Efficiency Gain: ~{((5 - len(selected_modes)) / 5 * 100):.0f}% reduction in API calls")
+                    logger.info(f"  └─ Efficiency Gain: ~{routing_result['efficiency_gain']:.0f}% reduction in API calls")
 
                 # Save comprehensive evaluation
                 eval_file = os.path.join(output_dir, "evaluations_detailed.txt")
@@ -576,52 +543,36 @@ RECOMMENDED FINAL ANSWER
                 await rag.lightrag.finalize_storages()
 
     except Exception as e:
-        logger.error(f"Error processing with RAG: {str(e)}")
+        logger.error(f"Error processing with Adaptive RAG: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
 
 
 def main():
-    """Main function to run the example"""
-    parser = argparse.ArgumentParser(description="MinerU RAG Example")
+    """Main function to run the Adaptive RAG example"""
+    parser = argparse.ArgumentParser(description="Adaptive RAG Example with QueryRouter")
     parser.add_argument("file_path", help="Path to the document to process")
-    parser.add_argument(
-        "--working_dir", "-w", default="./1560_rag_storage", help="Working directory path"
-    )
-    parser.add_argument(
-        "--output", "-o", default="./1560_output", help="Output directory path"
-    )
-    parser.add_argument(
-        "--api-key",
-        default=os.getenv("LLM_BINDING_API_KEY"),
-        help="OpenAI API key (defaults to LLM_BINDING_API_KEY env var)",
-    )
-    parser.add_argument(
-        "--base-url",
-        default=os.getenv("LLM_BINDING_HOST"),
-        help="Optional base URL for API",
-    )
-    parser.add_argument(
-        "--parser",
-        default=os.getenv("PARSER", "mineru"),
-        help="Optional base URL for API",
-    )
+    parser.add_argument("--working_dir", "-w", default="./rag_storage", help="Working directory path")
+    parser.add_argument("--output", "-o", default="./output", help="Output directory path")
+    parser.add_argument("--api-key", default=os.getenv("LLM_BINDING_API_KEY"), help="OpenAI API key")
+    parser.add_argument("--base-url", default=os.getenv("LLM_BINDING_HOST"), help="Optional base URL for API")
+    parser.add_argument("--parser", default=os.getenv("PARSER", "mineru"), help="Parser to use (mineru or docling)")
 
     args = parser.parse_args()
 
     # Check if API key is provided
     if not args.api_key or os.getenv("LLM_BINDING_API_KEY") is None:
         logger.error("Error: OpenAI API key is required")
-        logger.error("Set api key environment variable or use --api-key option")
+        logger.error("Set LLM_BINDING_API_KEY environment variable or use --api-key option")
         return
 
-    # Create output directory if specified
+    # Create output directory
     if args.output:
         os.makedirs(args.output, exist_ok=True)
 
-    # Process with RAG
+    # Process with Adaptive RAG
     asyncio.run(
-        process_with_rag(
+        process_with_adaptive_rag(
             args.file_path,
             args.output,
             args.api_key,
@@ -636,9 +587,9 @@ if __name__ == "__main__":
     # Configure logging first
     configure_logging()
 
-    print("RAGAnything Example")
-    print("=" * 30)
-    print("Processing document with multimodal RAG pipeline")
-    print("=" * 30)
+    print("Adaptive RAG Example with QueryRouter")
+    print("=" * 50)
+    print("Intelligent query-driven mode selection")
+    print("=" * 50)
 
     main()
