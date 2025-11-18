@@ -1,0 +1,26 @@
+# GAHR-MSR Framework Requirements
+# Additional dependencies for Graph-Augmented Hybrid Retrieval and Multi-Stage Re-ranking
+
+# Core ML libraries
+torch>=2.0.0
+transformers>=4.30.0
+
+# ColBERT model support
+# Note: colbert-ai package can be used as alternative to transformers implementation
+# colbert-ai>=0.2.0  # Optional: Official ColBERT implementation
+
+# Numpy for numerical operations
+numpy>=1.24.0
+
+# Optional: SPLADE for sparse retrieval
+# sentence-transformers>=2.2.0  # For SPLADE embeddings
+
+# Already included in main RAGAnything requirements:
+# - lightrag-hku (for graph construction and base RAG)
+# - huggingface_hub (for model downloads)
+
+# GPU Support (Optional but recommended)
+# Install CUDA-enabled PyTorch from:
+# pip install torch --index-url https://download.pytorch.org/whl/cu118
+# or for CUDA 12.1:
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
