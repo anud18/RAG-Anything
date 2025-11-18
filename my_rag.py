@@ -284,10 +284,137 @@ async def process_with_rag(
         #     await rag.finalize_storages()
 
 
+        # Adaptive RAG: Query complexity classifier
+        async def classify_query_complexity(query_text: str) -> dict:
+            """
+            Classify query complexity to determine optimal retrieval strategy.
+            Based on Adaptive-RAG paper: dynamically select retrieval modes based on query complexity.
+
+            Returns:
+                dict: {
+                    "complexity": "simple" | "moderate" | "complex",
+                    "reasoning": str,
+                    "recommended_modes": list,
+                    "confidence": float
+                }
+            """
+            classification_prompt = f"""Analyze the following user query and classify its complexity level for RAG retrieval.
+
+User Query: {query_text}
+
+Classification Criteria:
+
+1. SIMPLE queries:
+   - Direct factual questions (Who, What, When, Where)
+   - Single entity lookup
+   - Straightforward information retrieval
+   - Example: "給我PCD急救人員名單", "What is the capital of France?"
+   - Recommended: Naive or Local mode (simple vector search)
+
+2. MODERATE queries:
+   - Requires combining multiple facts
+   - Comparison or analysis of 2-3 entities
+   - Requires some reasoning
+   - Example: "比較A和B的差異", "How does X affect Y?"
+   - Recommended: Hybrid mode (combines local and global)
+
+3. COMPLEX queries:
+   - Multi-hop reasoning required
+   - Requires synthesizing information across multiple sources
+   - Abstract concepts or relationships
+   - Analytical or summarization tasks
+   - Example: "分析整體趨勢", "What are the implications of X on Y and Z?"
+   - Recommended: Mix or Global mode (knowledge graph + vector search)
+
+Please analyze the query and provide your classification in this EXACT format:
+Complexity: [simple/moderate/complex]
+Confidence: [0.0-1.0]
+Reasoning: [Brief explanation of why you classified it this way]
+Recommended Modes: [comma-separated list of modes]
+
+Important: Be precise and consistent with the format."""
+
+            try:
+                classification = await llm_model_func_with_retry(
+                    classification_prompt,
+                    system_prompt="You are an expert query analyzer. Classify queries accurately and consistently."
+                )
+
+                # Parse the classification result
+                complexity = "moderate"  # default
+                confidence = 0.5
+                reasoning = ""
+                recommended_modes = ["hybrid"]
+
+                lines = classification.strip().split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith("Complexity:"):
+                        complexity = line.split(":", 1)[1].strip().lower()
+                    elif line.startswith("Confidence:"):
+                        try:
+                            confidence = float(line.split(":", 1)[1].strip())
+                        except:
+                            confidence = 0.5
+                    elif line.startswith("Reasoning:"):
+                        reasoning = line.split(":", 1)[1].strip()
+                    elif line.startswith("Recommended Modes:"):
+                        modes_str = line.split(":", 1)[1].strip()
+                        recommended_modes = [m.strip().lower() for m in modes_str.split(",")]
+
+                return {
+                    "complexity": complexity,
+                    "reasoning": reasoning,
+                    "recommended_modes": recommended_modes,
+                    "confidence": confidence,
+                    "raw_classification": classification
+                }
+
+            except Exception as e:
+                logger.error(f"Error in query classification: {str(e)}")
+                # Fallback to moderate complexity
+                return {
+                    "complexity": "moderate",
+                    "reasoning": f"Classification failed: {str(e)}. Defaulting to moderate.",
+                    "recommended_modes": ["hybrid"],
+                    "confidence": 0.0,
+                    "raw_classification": ""
+                }
+
+        # Helper function to select modes based on complexity
+        def select_modes_by_complexity(complexity: str, recommended_modes: list = None) -> list:
+            """
+            Select retrieval modes based on query complexity.
+
+            Args:
+                complexity: "simple", "moderate", or "complex"
+                recommended_modes: Optional list from classifier
+
+            Returns:
+                list: Selected mode names
+            """
+            # Use recommended modes if available and valid
+            if recommended_modes:
+                valid_modes = ["local", "global", "hybrid", "naive", "mix"]
+                filtered = [m for m in recommended_modes if m in valid_modes]
+                if filtered:
+                    return filtered
+
+            # Fallback to predefined strategies
+            mode_strategy = {
+                "simple": ["naive", "local"],           # Fast, simple retrieval
+                "moderate": ["hybrid", "local"],         # Balanced approach
+                "complex": ["mix", "global", "hybrid"]   # Comprehensive retrieval
+            }
+
+            return mode_strategy.get(complexity, ["hybrid"])
+
         # Helper function to query with all modes and get source context
-        async def query_all_modes_with_context(query_text: str):
+        async def query_all_modes_with_context(query_text: str, modes: list = None):
             """Query using all retrieval modes and return results with source context"""
-            modes = ["local", "global", "hybrid", "naive", "mix"]
+            if modes is None:
+                modes = ["local", "global", "hybrid", "naive", "mix"]
+
             results = {}
 
             for mode in modes:
@@ -443,6 +570,16 @@ RECOMMENDED FINAL ANSWER
         # Example queries - demonstrating different query approaches
         logger.info("\nQuerying processed document:")
 
+        # Configuration: Set retrieval strategy
+        # Options:
+        #   - "adaptive": Use Adaptive-RAG to intelligently select modes based on query complexity (RECOMMENDED)
+        #   - "comprehensive": Query all modes and compare (thorough but slower and more expensive)
+        retrieval_strategy = os.getenv("RETRIEVAL_STRATEGY", "adaptive")  # adaptive or comprehensive
+
+        logger.info(f"Retrieval Strategy: {retrieval_strategy.upper()}")
+        logger.info(f"  - adaptive: Smart mode selection based on query complexity")
+        logger.info(f"  - comprehensive: Query all 5 modes for comparison\n")
+
         # 1. Pure text queries using aquery()
         text_queries = [
             "給我PCD急救人員名單，你可以使用工具計算",
@@ -458,9 +595,43 @@ RECOMMENDED FINAL ANSWER
             logger.info(f"{'='*80}")
 
             try:
-                # Step 1: Get results from all modes with source context
-                logger.info("\n[Step 1/3] Querying with all retrieval modes (with source citations)...")
-                mode_results = await query_all_modes_with_context(query)
+                # Step 0: Adaptive RAG - Classify query complexity (if enabled)
+                selected_modes = None
+                classification_result = None
+
+                if retrieval_strategy == "adaptive":
+                    logger.info("\n[Step 0/4] 🧠 Adaptive RAG: Classifying query complexity...")
+                    classification_result = await classify_query_complexity(query)
+
+                    logger.info(f"  ├─ Complexity: {classification_result['complexity'].upper()}")
+                    logger.info(f"  ├─ Confidence: {classification_result['confidence']:.2f}")
+                    logger.info(f"  ├─ Reasoning: {classification_result['reasoning']}")
+
+                    # Select modes based on complexity
+                    selected_modes = select_modes_by_complexity(
+                        classification_result['complexity'],
+                        classification_result['recommended_modes']
+                    )
+                    logger.info(f"  └─ Selected Modes: {', '.join(m.upper() for m in selected_modes)}")
+
+                    # Save classification to file
+                    classification_file = os.path.join(output_dir, "adaptive_classifications.txt")
+                    with open(classification_file, "a", encoding="utf-8") as f:
+                        f.write(f"\n{'='*80}\n")
+                        f.write(f"Query: {query}\n")
+                        f.write(f"{'='*80}\n")
+                        f.write(f"Complexity: {classification_result['complexity']}\n")
+                        f.write(f"Confidence: {classification_result['confidence']:.2f}\n")
+                        f.write(f"Reasoning: {classification_result['reasoning']}\n")
+                        f.write(f"Selected Modes: {', '.join(selected_modes)}\n")
+                        f.write(f"\nFull Classification:\n{classification_result['raw_classification']}\n")
+
+                # Step 1: Get results from selected/all modes with source context
+                step_num = "1/4" if retrieval_strategy == "adaptive" else "1/3"
+                mode_desc = f"selected modes ({', '.join(selected_modes)})" if selected_modes else "all modes"
+                logger.info(f"\n[Step {step_num}] Querying with {mode_desc} (with source citations)...")
+
+                mode_results = await query_all_modes_with_context(query, modes=selected_modes)
 
                 # Save detailed results with context
                 results_file = os.path.join(output_dir, "mode_results_with_sources.txt")
@@ -480,12 +651,22 @@ RECOMMENDED FINAL ANSWER
                         f.write(f"{'-'*80}\n\n")
 
                 # Step 2: Two-stage LLM evaluation
-                logger.info("\n[Step 2/3] Two-stage LLM evaluation...")
+                step_num = "2/4" if retrieval_strategy == "adaptive" else "2/3"
+                logger.info(f"\n[Step {step_num}] Two-stage LLM evaluation...")
                 evaluation_results = await evaluate_best_answer_two_stage(query, mode_results)
 
                 # Step 3: Log and save evaluation
-                logger.info("\n[Step 3/3] Evaluation Complete!")
+                step_num = "3/4" if retrieval_strategy == "adaptive" else "3/3"
+                logger.info(f"\n[Step {step_num}] Evaluation Complete!")
                 logger.info(f"\n{evaluation_results['final_evaluation']}")
+
+                # Step 4: Summary and insights (Adaptive RAG only)
+                if retrieval_strategy == "adaptive" and classification_result:
+                    logger.info(f"\n[Step 4/4] 📊 Adaptive RAG Summary:")
+                    logger.info(f"  ├─ Query Complexity: {classification_result['complexity'].upper()}")
+                    logger.info(f"  ├─ Modes Used: {', '.join(m.upper() for m in selected_modes)}")
+                    logger.info(f"  ├─ Modes Saved: {5 - len(selected_modes)} mode(s) skipped")
+                    logger.info(f"  └─ Efficiency Gain: ~{((5 - len(selected_modes)) / 5 * 100):.0f}% reduction in API calls")
 
                 # Save comprehensive evaluation
                 eval_file = os.path.join(output_dir, "evaluations_detailed.txt")
