@@ -744,3 +744,285 @@ class QueryMixin:
         return loop.run_until_complete(
             self.aquery_with_multimodal(query, multimodal_content, mode=mode, **kwargs)
         )
+
+    async def aquery_adaptive(
+        self, query: str, return_analysis: bool = False, **kwargs
+    ) -> str | Dict[str, Any]:
+        """
+        Adaptive query - automatically selects the best retrieval mode based on query complexity
+
+        This method implements the Adaptive-RAG approach:
+        1. Analyzes the query to determine its complexity and type
+        2. Routes to the most appropriate retrieval mode
+        3. Executes the query with the selected mode
+
+        Args:
+            query: Query text
+            return_analysis: If True, returns dict with both result and routing analysis
+            **kwargs: Other query parameters (will be passed to QueryParam)
+
+        Returns:
+            str: Query result (if return_analysis=False)
+            Dict: Contains 'result' and 'analysis' (if return_analysis=True)
+
+        Example:
+            # Simple usage
+            result = await rag.aquery_adaptive("What is machine learning?")
+
+            # With analysis details
+            response = await rag.aquery_adaptive(
+                "What is machine learning?",
+                return_analysis=True
+            )
+            print(f"Mode used: {response['analysis']['recommended_mode']}")
+            print(f"Result: {response['result']}")
+        """
+        # Ensure LightRAG is initialized
+        await self._ensure_lightrag_initialized()
+
+        # Import here to avoid circular dependency
+        from raganything.adaptive_router import AdaptiveQueryRouter
+
+        # Ensure we have LLM function available
+        if not hasattr(self, "llm_model_func") or self.llm_model_func is None:
+            # Try to get from lightrag
+            if hasattr(self, "lightrag") and hasattr(self.lightrag, "llm_model_func"):
+                llm_func = self.lightrag.llm_model_func
+            else:
+                raise ValueError(
+                    "LLM model function is required for adaptive query routing"
+                )
+        else:
+            llm_func = self.llm_model_func
+
+        self.logger.info(f"Analyzing query for adaptive routing: {query[:100]}...")
+
+        # Create router and analyze query
+        router = AdaptiveQueryRouter(llm_func)
+        analysis = await router.analyze_query(query)
+
+        # Log the routing decision
+        self.logger.info(
+            f"Query classified as {analysis['complexity'].value} "
+            f"({analysis['query_type'].value})"
+        )
+        self.logger.info(f"Routing to mode: {analysis['recommended_mode']}")
+        self.logger.info(f"Reasoning: {analysis['reasoning']}")
+
+        # Execute query with recommended mode
+        result = await self.aquery(query, mode=analysis["recommended_mode"], **kwargs)
+
+        if return_analysis:
+            return {
+                "result": result,
+                "analysis": {
+                    "complexity": analysis["complexity"].value,
+                    "query_type": analysis["query_type"].value,
+                    "recommended_mode": analysis["recommended_mode"],
+                    "reasoning": analysis["reasoning"],
+                    "confidence": analysis["confidence"],
+                },
+            }
+        else:
+            return result
+
+    async def aquery_multi_mode(
+        self,
+        query: str,
+        modes: List[str] = None,
+        return_all_results: bool = False,
+        **kwargs,
+    ) -> str | Dict[str, Any]:
+        """
+        Multi-mode query - tries multiple retrieval modes and uses LLM to select the best result
+
+        This method:
+        1. Executes the query with multiple retrieval modes
+        2. Uses LLM to evaluate and select the best result
+        3. Returns the best result (or all results for comparison)
+
+        Args:
+            query: Query text
+            modes: List of modes to try (default: ["naive", "local", "hybrid", "global", "mix"])
+            return_all_results: If True, returns all results for comparison
+            **kwargs: Other query parameters (will be passed to QueryParam)
+
+        Returns:
+            str: Best query result (if return_all_results=False)
+            Dict: All results with evaluation (if return_all_results=True)
+
+        Example:
+            # Get best result
+            result = await rag.aquery_multi_mode("What is machine learning?")
+
+            # Compare all results
+            comparison = await rag.aquery_multi_mode(
+                "What is machine learning?",
+                return_all_results=True
+            )
+            for mode, data in comparison['results'].items():
+                print(f"{mode}: {data['result'][:100]}...")
+        """
+        # Ensure LightRAG is initialized
+        await self._ensure_lightrag_initialized()
+
+        # Default modes to try
+        if modes is None:
+            modes = ["naive", "local", "hybrid", "global", "mix"]
+
+        self.logger.info(f"Executing multi-mode query with modes: {modes}")
+        self.logger.info(f"Query: {query[:100]}...")
+
+        # Execute query with all modes
+        results = {}
+        for mode in modes:
+            try:
+                self.logger.info(f"Trying mode: {mode}")
+                result = await self.aquery(query, mode=mode, **kwargs)
+                results[mode] = {"result": result, "success": True, "error": None}
+            except Exception as e:
+                self.logger.error(f"Error with mode {mode}: {str(e)}")
+                results[mode] = {"result": None, "success": False, "error": str(e)}
+
+        # Filter successful results
+        successful_results = {
+            mode: data for mode, data in results.items() if data["success"]
+        }
+
+        if not successful_results:
+            raise ValueError("All retrieval modes failed")
+
+        self.logger.info(
+            f"Successfully retrieved results from {len(successful_results)} modes"
+        )
+
+        # Use LLM to evaluate and select best result
+        best_mode, evaluation = await self._evaluate_multi_mode_results(
+            query, successful_results
+        )
+
+        self.logger.info(f"Selected best mode: {best_mode}")
+        self.logger.info(f"Evaluation: {evaluation}")
+
+        if return_all_results:
+            return {
+                "best_result": successful_results[best_mode]["result"],
+                "best_mode": best_mode,
+                "evaluation": evaluation,
+                "results": successful_results,
+            }
+        else:
+            return successful_results[best_mode]["result"]
+
+    async def _evaluate_multi_mode_results(
+        self, query: str, results: Dict[str, Dict[str, Any]]
+    ) -> tuple[str, str]:
+        """
+        Use LLM to evaluate multiple results and select the best one
+
+        Args:
+            query: Original query
+            results: Dictionary of mode -> result data
+
+        Returns:
+            tuple: (best_mode, evaluation_reasoning)
+        """
+        # Ensure we have LLM function
+        if not hasattr(self, "llm_model_func") or self.llm_model_func is None:
+            if hasattr(self, "lightrag") and hasattr(self.lightrag, "llm_model_func"):
+                llm_func = self.lightrag.llm_model_func
+            else:
+                # Fallback to first mode if no LLM available
+                return list(results.keys())[0], "No LLM available for evaluation"
+        else:
+            llm_func = self.llm_model_func
+
+        # Prepare evaluation prompt
+        results_text = ""
+        for i, (mode, data) in enumerate(results.items(), 1):
+            results_text += f"\n--- Result {i} (Mode: {mode}) ---\n"
+            results_text += data["result"]
+            results_text += "\n"
+
+        evaluation_prompt = f"""You are evaluating multiple retrieval results for the same query to select the best one.
+
+User Query: "{query}"
+
+Retrieved Results from Different Modes:
+{results_text}
+
+Please evaluate each result based on:
+1. Relevance to the query
+2. Completeness of information
+3. Accuracy and correctness
+4. Clarity and coherence
+
+Select the BEST result and respond in the following JSON format:
+{{
+    "best_mode": "the mode name of the best result",
+    "reasoning": "brief explanation of why this result is best (2-3 sentences)",
+    "ranking": ["mode1", "mode2", ...] (all modes ranked from best to worst)
+}}"""
+
+        evaluation_system = "You are an expert at evaluating information retrieval results and selecting the most relevant and comprehensive answers."
+
+        try:
+            # Get LLM evaluation
+            response = await llm_func(
+                evaluation_prompt, system_prompt=evaluation_system
+            )
+
+            # Parse response
+            response_text = response.strip()
+            if "```json" in response_text:
+                start = response_text.find("```json") + 7
+                end = response_text.find("```", start)
+                response_text = response_text[start:end].strip()
+            elif "```" in response_text:
+                start = response_text.find("```") + 3
+                end = response_text.find("```", start)
+                response_text = response_text[start:end].strip()
+
+            evaluation = json.loads(response_text)
+
+            best_mode = evaluation.get("best_mode")
+            reasoning = evaluation.get("reasoning", "No reasoning provided")
+
+            # Validate that best_mode is in results
+            if best_mode not in results:
+                self.logger.warning(
+                    f"LLM selected invalid mode {best_mode}, using first mode"
+                )
+                best_mode = list(results.keys())[0]
+
+            return best_mode, reasoning
+
+        except Exception as e:
+            self.logger.error(f"Error evaluating results: {str(e)}")
+            # Fallback to first mode
+            return list(results.keys())[0], f"Evaluation failed: {str(e)}"
+
+    # Synchronous versions
+    def query_adaptive(
+        self, query: str, return_analysis: bool = False, **kwargs
+    ) -> str | Dict[str, Any]:
+        """Synchronous version of adaptive query"""
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(
+            self.aquery_adaptive(query, return_analysis=return_analysis, **kwargs)
+        )
+
+    def query_multi_mode(
+        self,
+        query: str,
+        modes: List[str] = None,
+        return_all_results: bool = False,
+        **kwargs,
+    ) -> str | Dict[str, Any]:
+        """Synchronous version of multi-mode query"""
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(
+            self.aquery_multi_mode(
+                query, modes=modes, return_all_results=return_all_results, **kwargs
+            )
+        )
